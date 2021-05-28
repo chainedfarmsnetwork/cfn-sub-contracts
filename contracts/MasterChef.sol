@@ -64,6 +64,8 @@ contract MasterChef is Ownable {
     uint256 public baseEmissionRate;
     // Maximum emission rate per block possible
     uint256 public maxEmissionRate;
+    // CFN Address
+    address public cfnAddress;
 
     // Info of each pool.
     PoolInfo[] public poolInfo;
@@ -87,7 +89,8 @@ contract MasterChef is Ownable {
         bool _devFees,
         uint256 _devFeesPercent,
         uint256 _baseEmissionRate,
-        uint256 _maxEmissionRate
+        uint256 _maxEmissionRate,
+        address _cfnAddress
     ) public {
         require(_devFeesPercent <= 500, "Incorrect dev fees: too high value");
         require(_baseEmissionRate < _maxEmissionRate, "Incorrect base emission rate, higher than max emission rate");
@@ -101,6 +104,7 @@ contract MasterChef is Ownable {
         devFeesPercent = _devFeesPercent;
         baseEmissionRate = _baseEmissionRate;
         maxEmissionRate = _maxEmissionRate;
+        cfnAddress = _cfnAddress;
     }
 
     function poolLength() external view returns (uint256) {
@@ -252,7 +256,7 @@ contract MasterChef is Ownable {
             // Because our own token have a specific burn system, we need to calculate and remove the burn amount
             // when its staked in single token pool, we need to be specific because only our token has the
             // getCurrentBurnPercent() method
-            if (pool.lpToken == token) {
+            if (address(pool.lpToken) == cfnAddress) {
                 if (pool.lpToken.getCurrentBurnPercent() > 0) {
                     uint256 burnAmount = _amount.mul(token.getCurrentBurnPercent()).div(10000);
                     _amount = _amount.sub(burnAmount);
@@ -359,9 +363,7 @@ contract MasterChef is Ownable {
     // Because the auto-burn system is kinda new and never saw it in action, this function will allow to
     // externally update the base emission rate in case the supply is getting burn way faster than predicted
     // MUST BE USED CAREFULLY, TWEAKING THIS NUMBER CAN RESULT IN SOME SERIOUS ECONOMICAL IMPACT
-    // Capped to 20 (but that's really huge...)
     function updateBaseEmissionRate(uint256 _baseEmissionRate) public onlyOwner {
-        require(_baseEmissionRate <= 20000000000000000000, "updateBaseEmissionRate: too high value");
         require(
             _baseEmissionRate <= maxEmissionRate,
             "updateBaseEmissionRate: too high value, must be under max emission rate"
@@ -371,7 +373,6 @@ contract MasterChef is Ownable {
 
     // Because we can tweak manually base emission rate, we need to be able to tweak the max emission rate too :)
     function updateMaxEmissionRate(uint256 _maxEmissionRate) public onlyOwner {
-        require(_maxEmissionRate <= 60000000000000000000, "updateMaxEmissionRate: too high value");
         require(_maxEmissionRate >= baseEmissionRate, "updateMaxEmissionRate: too low value");
         maxEmissionRate = _maxEmissionRate;
     }
