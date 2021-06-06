@@ -24,7 +24,9 @@ contract MasterChef is Ownable {
     struct UserInfo {
         uint256 amount; // How many LP tokens the user has provided.
         uint256 rewardDebt; // Reward debt. See explanation below.
-        //
+        uint256 rewardLockedUp; // Reward locked up.
+        uint256 nextHarvestUntil; // When can the user harvest again.
+
         // We do some fancy math here. Basically, any point in time, the amount of TOKENs
         // entitled to a user but is pending to be distributed is:
         //
@@ -44,6 +46,7 @@ contract MasterChef is Ownable {
         uint256 lastRewardBlock; // Last block number that TOKENs distribution occurs.
         uint256 accTokenPerShare; // Accumulated TOKENs per share, times 1e12. See below.
         uint16 depositFeeBP; // Deposit fee in basis points
+        uint256 harvestInterval; // Harvest interval in seconds
     }
 
     // The TOKEN TOKEN!
@@ -66,6 +69,10 @@ contract MasterChef is Ownable {
     uint256 public maxEmissionRate;
     // CFN Address
     address public cfnAddress;
+    // Previous Subfarm Token Address
+    address public prevSfnAddress;
+    // Max harvest interval: 14 days.
+    uint256 public constant MAXIMUM_HARVEST_INTERVAL = 14 days;
 
     // Info of each pool.
     PoolInfo[] public poolInfo;
@@ -79,6 +86,7 @@ contract MasterChef is Ownable {
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event RewardLockedUp(address indexed user, uint256 indexed pid, uint256 amountLockedUp);
 
     constructor(
         Token _token,
@@ -90,7 +98,8 @@ contract MasterChef is Ownable {
         uint256 _devFeesPercent,
         uint256 _baseEmissionRate,
         uint256 _maxEmissionRate,
-        address _cfnAddress
+        address _cfnAddress,
+        address _prevSfnAddress
     ) public {
         require(_devFeesPercent <= 500, "Incorrect dev fees: too high value");
         require(_baseEmissionRate < _maxEmissionRate, "Incorrect base emission rate, higher than max emission rate");
@@ -105,10 +114,17 @@ contract MasterChef is Ownable {
         baseEmissionRate = _baseEmissionRate;
         maxEmissionRate = _maxEmissionRate;
         cfnAddress = _cfnAddress;
+        prevSfnAddress = _prevSfnAddress;
     }
 
     function poolLength() external view returns (uint256) {
         return poolInfo.length;
+    }
+
+    // View function to see if user can harvest
+    function canHarvest(uint256 _pid, address _user) public view returns (bool) {
+        UserInfo storage user = userInfo[_pid][_user];
+        return block.timestamp >= user.nextHarvestUntil;
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
@@ -117,10 +133,12 @@ contract MasterChef is Ownable {
         uint256 _allocPoint,
         IBEP20 _lpToken,
         uint16 _depositFeeBP,
+        uint256 _harvestInterval,
         bool _withUpdate
     ) public onlyOwner {
         // Capped at 6%, project constraint
         require(_depositFeeBP <= 600, "add: invalid deposit fee basis points");
+        require(_harvestInterval <= MAXIMUM_HARVEST_INTERVAL, "add: invalid harvest interval");
         if (_withUpdate) {
             massUpdatePools();
         }
@@ -132,7 +150,8 @@ contract MasterChef is Ownable {
                 allocPoint: _allocPoint,
                 lastRewardBlock: lastRewardBlock,
                 accTokenPerShare: 0,
-                depositFeeBP: _depositFeeBP
+                depositFeeBP: _depositFeeBP,
+                harvestInterval: _harvestInterval
             })
         );
     }
@@ -142,16 +161,19 @@ contract MasterChef is Ownable {
         uint256 _pid,
         uint256 _allocPoint,
         uint16 _depositFeeBP,
+        uint256 _harvestInterval,
         bool _withUpdate
     ) public onlyOwner {
         // Capped at 6%, project constraint
         require(_depositFeeBP <= 600, "set: invalid deposit fee basis points");
+        require(_harvestInterval <= MAXIMUM_HARVEST_INTERVAL, "set: invalid harvest interval");
         if (_withUpdate) {
             massUpdatePools();
         }
         totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(_allocPoint);
         poolInfo[_pid].allocPoint = _allocPoint;
         poolInfo[_pid].depositFeeBP = _depositFeeBP;
+        poolInfo[_pid].harvestInterval = _harvestInterval;
     }
 
     // Return reward multiplier over the given _from to _to block.
@@ -170,7 +192,8 @@ contract MasterChef is Ownable {
             uint256 tokenReward = multiplier.mul(tokenPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
             accTokenPerShare = accTokenPerShare.add(tokenReward.mul(1e12).div(lpSupply));
         }
-        return user.amount.mul(accTokenPerShare).div(1e12).sub(user.rewardDebt);
+        uint256 pending = user.amount.mul(accTokenPerShare).div(1e12).sub(user.rewardDebt);
+        return pending.add(user.rewardLockedUp);
     }
 
     // Update reward variables for all pools. Be careful of gas spending!
@@ -246,19 +269,22 @@ contract MasterChef is Ownable {
 
         updatePool(_pid);
 
-        if (user.amount > 0) {
-            uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
-            if (pending > 0) {
-                safeTokenTransfer(msg.sender, pending);
-            }
-        }
+        // INSERT PAYORLOCKUP HERE ?
+        payOrLockupPendingToken(_pid);
+        // if (user.amount > 0) {
+        //     uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
+        //     if (pending > 0) {
+        //         safeTokenTransfer(msg.sender, pending);
+        //     }
+        // }
+
         if (_amount > 0) {
             // Because our own token have a specific burn system, we need to calculate and remove the burn amount
             // when its staked in single token pool, we need to be specific because only our token has the
             // getCurrentBurnPercent() method
-            if (address(pool.lpToken) == cfnAddress) {
+            if (address(pool.lpToken) == cfnAddress || address(pool.lpToken) == prevSfnAddress) {
                 if (pool.lpToken.getCurrentBurnPercent() > 0) {
-                    uint256 burnAmount = _amount.mul(token.getCurrentBurnPercent()).div(10000);
+                    uint256 burnAmount = _amount.mul(pool.lpToken.getCurrentBurnPercent()).div(10000);
                     _amount = _amount.sub(burnAmount);
                 }
             }
@@ -283,13 +309,15 @@ contract MasterChef is Ownable {
     function withdraw(uint256 _pid, uint256 _amount) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-
         require(user.amount >= _amount, "withdraw: not good");
+
         updatePool(_pid);
-        uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
-        if (pending > 0) {
-            safeTokenTransfer(msg.sender, pending);
-        }
+        // INSERT PAYORLOCKUP HERE?
+        payOrLockupPendingToken(_pid);
+        // uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
+        // if (pending > 0) {
+        //     safeTokenTransfer(msg.sender, pending);
+        // }
         if (_amount > 0) {
             user.amount = user.amount.sub(_amount);
             pool.lpToken.safeTransfer(address(msg.sender), _amount);
@@ -303,9 +331,6 @@ contract MasterChef is Ownable {
     function emergencyWithdraw(uint256 _pid) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-        uint256 amount = user.amount;
-        user.amount = 0;
-        user.rewardDebt = 0;
 
         // Burn the pending tokens to ensure they are not stuck
         uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
@@ -313,8 +338,41 @@ contract MasterChef is Ownable {
             safeTokenTransfer(token.getDeadAddress(), pending);
         }
 
+        uint256 amount = user.amount;
+        user.amount = 0;
+        user.rewardDebt = 0;
+        user.rewardLockedUp = 0;
+        user.nextHarvestUntil = 0;
+
         pool.lpToken.safeTransfer(address(msg.sender), amount);
         emit EmergencyWithdraw(msg.sender, _pid, amount);
+    }
+
+    // Pay or lockup pending Tokens.
+    function payOrLockupPendingToken(uint256 _pid) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+
+        if (user.nextHarvestUntil == 0) {
+            user.nextHarvestUntil = block.timestamp.add(pool.harvestInterval);
+        }
+
+        uint256 pending = user.amount.mul(pool.accTokenPerShare).div(1e12).sub(user.rewardDebt);
+        if (canHarvest(_pid, msg.sender)) {
+            if (pending > 0 || user.rewardLockedUp > 0) {
+                uint256 totalRewards = pending.add(user.rewardLockedUp);
+
+                // reset lockup
+                user.rewardLockedUp = 0;
+                user.nextHarvestUntil = block.timestamp.add(pool.harvestInterval);
+
+                // send rewards
+                safeTokenTransfer(msg.sender, totalRewards);
+            }
+        } else if (pending > 0) {
+            user.rewardLockedUp = user.rewardLockedUp.add(pending);
+            emit RewardLockedUp(msg.sender, _pid, pending);
+        }
     }
 
     // Safe token transfer function, just in case if rounding error causes pool to not have enough TOKENs.
@@ -331,6 +389,14 @@ contract MasterChef is Ownable {
     function dev(address _devaddr) public {
         require(msg.sender == devaddr, "dev: wut?");
         devaddr = _devaddr;
+    }
+
+    // Allow to change ownership of the token for more flexibility in case we need to fix something
+    // in masterchef, must be used very carefully
+    function transferTokenOwnership(address _newAddress) public onlyOwner {
+        require(_newAddress != address(0), "Ownable: new owner is the zero address");
+        require(msg.sender == devaddr, "dev: wut?");
+        token.transferOwnership(_newAddress);
     }
 
     function setFeeAddress(address _feeAddress) public {
